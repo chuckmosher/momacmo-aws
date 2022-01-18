@@ -1,0 +1,5 @@
+{
+  "bucket": "momacmos3",
+  "prefix": "smomacmo/meagerdas/1432_aws_output_filt_5_50_despike",
+  "key": "V11F403"
+}
