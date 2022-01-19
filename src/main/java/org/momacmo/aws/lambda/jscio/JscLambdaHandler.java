@@ -34,7 +34,7 @@ public class JscLambdaHandler implements RequestHandler<SQSEvent, JscLambdaOutpu
         try {
           System.out.println("Get S3 client ... ");
           System.out.flush();
-          AmazonS3 s3 = AmazonS3ClientBuilder.defaultClient();
+          AmazonS3 s3 = AmazonS3ClientBuilder.standard().withRegion("us-east-1").build();
           System.out.println("... S3 client found");
           System.out.flush();
           output = getFrameTraces(s3, input);

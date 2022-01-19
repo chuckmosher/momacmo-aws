@@ -5,6 +5,8 @@ public class JscLambdaOutput {
 	public float iotime;
 	public int iobytes;
 	public JscLambdaInput input;
+	public String status;
+	
 	public JscLambdaInput getInput() {
 		return input;
 	}
@@ -29,4 +31,10 @@ public class JscLambdaOutput {
 	public void setTraceCount( int traceCount ) {
 	  this.traceCount = traceCount;
 	}
+	public String getStatus() {
+	  return status;
+	}
+  public void setStatus(String status) {
+    this.status = status;
+  }
 }
