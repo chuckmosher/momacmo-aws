@@ -1,4 +1,4 @@
-package org.momacmo.aws.s3;
+package org.momacmo.aws.s3.jscio;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -10,21 +10,19 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.IntBuffer;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 import org.javaseis.compress.TraceCompressor;
+import org.javaseis.grid.BinGrid;
 import org.javaseis.grid.GridDefinition;
-import org.javaseis.parset.ParameterSetIO;
-import org.javaseis.properties.DataFormat;
 import org.javaseis.properties.TraceProperties;
 import org.javaseis.util.SeisException;
-
-import org.momacmo.javaseis.properties.PropertiesTree;
-import org.momacmo.javaseis.util.GridUtil;
+import org.momacmo.aws.s3.jscio.properties.JscFileProperties;
+import org.momacmo.aws.s3.jscio.properties.JsonUtil;
+import org.momacmo.aws.s3.jscio.properties.TracePropertiesImpl;
 
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
@@ -35,9 +33,6 @@ import com.amazonaws.services.s3.model.GetObjectRequest;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 import com.amazonaws.services.s3.model.S3Object;
 import com.fasterxml.jackson.databind.util.ByteBufferBackedInputStream;
-
-import edu.mines.jtk.util.ArrayMath;
-import edu.mines.jtk.util.ParameterSet;
 
 /**
  * Example implementation of using AWS S3 Object Storage to hold traces and
@@ -76,21 +71,14 @@ import edu.mines.jtk.util.ParameterSet;
  *
  */
 public class JsAwsS3 {
-  // SeisSpace properties
-  PropertiesTree propertiesTree = null;
-  ParameterSet filePropertiesParset = null;
-  ParameterSet tracePropertiesParset = null;
-  TraceProperties traceProperties = null;
-  ParameterSet binProperties = null;
-  static String SS_AWS_S3_PROPERTIES = "/SeisSpaceAwsS3.xml";
-  static String FILE_PROPERTIES = "FileProperties.xml";
+  JscFileProperties jscFileProperties;
+  public static String FILE_PROPERTIES_JSC = "JscFileProperties.json";
   // AWS bucket, prefix, and client
   String awsProfile, awsRegion;
   String awsBucket;
   String awsPrefix;
   AmazonS3 s3;
   // Runtime objects used internally
-  GridDefinition gridDefinition;
   ByteBuffer trcBuffer, hdrBuffer;
   TraceCompressor traceCompressor;
   int recordLength;
@@ -104,6 +92,8 @@ public class JsAwsS3 {
   int[] volRange, frmRange;
   int frameCount;
   int[] pos = new int[4];
+  // Buffer for S3 transfers
+  byte[] xfrBytes = new byte[16384];
 
   /**
    * Return true if this SeisSpace dataset uses AWS S3 to store traces and headers
@@ -115,10 +105,14 @@ public class JsAwsS3 {
     File f = new File(jsPath);
     if (!f.isDirectory())
       return false;
-    File fj = new File(jsPath + SS_AWS_S3_PROPERTIES);
+    File fj = new File(jsPath + File.separator + FILE_PROPERTIES_JSC);
     if (!fj.exists())
       return false;
     return true;
+  }
+  
+  public static boolean isJsAwsS3( JsAwsS3Parms parms) {
+    return isJsAwsS3( parms.awsProfile, parms.awsRegion, parms.awsBucket, parms.awsPrefix );
   }
 
   /**
@@ -150,7 +144,7 @@ public class JsAwsS3 {
       s3Tmp.shutdown();
       return false;
     }
-    if (s3Tmp.doesObjectExist(awsBucketName, awsPrefixName + "/" + FILE_PROPERTIES) == false) {
+    if (s3Tmp.doesObjectExist(awsBucketName, awsPrefixName + "/" + FILE_PROPERTIES_JSC) == false) {
       s3Tmp.shutdown();
       return false;
     }
@@ -159,60 +153,45 @@ public class JsAwsS3 {
   }
 
   /**
-   * Create a JavaSeis AWS-S3 dataset using an existing 'empty' SeisSpace dataset.
-   * The dataset should have been created in SeisSpace, but any data written in
-   * the dataset other than metadata will be ignored.
+   * Return the GridDefition for a JavaSeis Cloud AWS S3 Dataset
    * 
-   * @param awsBucketName   - AWS Bucket where the trace and header data will be
-   *                        written
-   * @param awsPrefixString - AWS Prefix within the bucket
-   * @param jsPath          - full path to the SeisSpace dataset on local disk
-   * @param overWrite       - set to true to over-write existing JavaSeis AWS-S3
-   *                        metadata
-   * @throws SeisException - on AWS access and I/O errors
+   * @param awsProfileName - credentials profile
+   * @param awsRegionName  - region name
+   * @param awsBucketName  - bucket name
+   * @param awsPrefixName  - prefix name
+   * @return GridDefintion for the dataset
+   * @throws SeisException on access errors
    */
-  public static void createFromExisting(String awsProfileName, String awsRegionName, String awsBucketName, String jsPath, boolean overwrite )
-      throws SeisException {
+  public static JscFileProperties getFileProperties(String awsProfileName, String awsRegionName, String awsBucketName,
+      String awsPrefixName) throws SeisException {
     AWSCredentials credentials = null;
     AmazonS3 s3Tmp = null;
+    String awsRegion = new String(awsRegionName);
     try {
       credentials = new ProfileCredentialsProvider(awsProfileName).getCredentials();
-      if (awsRegionName == null || awsRegionName.equals("default")) {
+      if (awsRegionName == null || awsRegionName == "default") {
         s3Tmp = AmazonS3ClientBuilder.standard().withCredentials(new AWSStaticCredentialsProvider(credentials)).build();
+        awsRegion = s3Tmp.getRegionName();
       } else {
         s3Tmp = AmazonS3ClientBuilder.standard().withCredentials(new AWSStaticCredentialsProvider(credentials))
             .withRegion(awsRegionName).build();
+        awsRegion = awsRegionName;
       }
     } catch (Exception e) {
-      e.printStackTrace();
-     throw new SeisException("Cannot load AWS credentials from the credential profiles file. "
-          + "Please make sure that your credentials file is at the correct "
-          + "location (~/.aws/credentials), and is in valid format.",e.getCause());
+      throw new SeisException("Invalid AWS credentials for profile: " + awsProfileName);
     }
     if (s3Tmp.doesBucketExistV2(awsBucketName) == false) {
       s3Tmp.shutdown();
-      throw new SeisException("Bucket does not exist: " + awsBucketName);
+      throw new SeisException("AWS Region " + awsRegion + " does not contain bucket: " + awsBucketName);
     }
-    String awsPrefixName = getAwsPrefixFromPath(jsPath);
-    if (awsPrefixName == null) {
+    String key = awsPrefixName + "/" + FILE_PROPERTIES_JSC;
+    if (s3Tmp.doesObjectExist(awsBucketName, key) == false) {
       s3Tmp.shutdown();
-      throw new SeisException("Could not construct AWS Prefix from path name: " + jsPath);
+      throw new SeisException(
+          "AWS Region " + awsRegion + " Bucket " + awsBucketName + " does not contain object: " + key);
     }
-    if (s3Tmp.listObjectsV2(awsBucketName, awsPrefixName).getKeyCount() > 0 && overwrite == false)
-      throw new SeisException("Bucket/Prefix exists and overWrite is false: " + awsBucketName + "/" + awsPrefixName);
-    // Create a parameter set and write to local disk
-    ParameterSet ssAwsS3Parms = new ParameterSet("SeisSpaceAwsS3");
-    ssAwsS3Parms.setString("awsRegion", awsRegionName);
-    ssAwsS3Parms.setString("awsBucket", awsBucketName);
-    ssAwsS3Parms.setString("awsPrefix", awsPrefixName);
-    try {
-      ParameterSetIO.writeFile(ssAwsS3Parms, jsPath + SS_AWS_S3_PROPERTIES);
-      // Copy FileProperties.xml to the AWS S3 Bucket / Prefix
-      putFile(s3Tmp, awsBucketName, awsPrefixName + "/" + FILE_PROPERTIES, jsPath + "/" + FILE_PROPERTIES);
-    } catch (Exception e) {
-      e.printStackTrace();
-      throw new SeisException("Faild to create JavaSeis AWS-S3 Metadata");
-    }
+    JscFileProperties fprops = (JscFileProperties) getJsonObject( s3Tmp, awsBucketName, key, JscFileProperties.class );    
+    return fprops;
   }
 
   public static String getAwsPrefixFromPath(String jsDatasetPath) {
@@ -259,20 +238,43 @@ public class JsAwsS3 {
       isOpen = false;
     }
   }
-  
+
   /**
    * Initialize JavaSeis AWS-S3 access using arguments from command line
    * 
-   * @param args - String array containing:
-   * [0] - AWS Profile
-   * [1] = AWS Region
-   * [2] - AWS Bucket
-   * [3] - AWS Prefix
+   * @param args - String array containing: [0] - AWS Profile [1] = AWS Region [2]
+   *             - AWS Bucket [3] - AWS Prefix
    * @throws SeisException - on access errors
    */
   public JsAwsS3(String[] args) throws SeisException {
-    this(args[0],args[1]);
-    openRemote(args[2],args[3]);
+    this(args[0], args[1]);
+    openRemote(args[2], args[3]);
+  }
+  
+  /**
+   * Open a JavaSeis Cloud datset
+   * @param awsProfile - AWS Credentials profile
+   * @param awsRegion - AWS Region name
+   * @param awsBucket - AWS Bucket name
+   * @param awsPrefix - AWS Prefix for the "folder" containing the dataset
+   * @throws SeisException - on AWS access and dataset errors
+   */
+  public JsAwsS3(String awsProfile, String awsRegion, String awsBucket, String awsPrefix) throws SeisException {
+    this(awsProfile, awsRegion);
+    openRemote(awsBucket, awsPrefix);
+  }  
+  
+  /**
+   * Open a JavaSeis Cloud datset
+   * @param awsProfile - AWS Credentials profile
+   * @param awsRegion - AWS Region name
+   * @param awsBucket - AWS Bucket name
+   * @param awsPrefix - AWS Prefix for the "folder" containing the dataset
+   * @throws SeisException - on AWS access and dataset errors
+   */
+  public JsAwsS3(JsAwsS3Parms parms) throws SeisException {
+    this(parms.awsProfile, parms.awsRegion);
+    openRemote(parms.awsBucket, parms.awsPrefix);
   }
 
   /**
@@ -294,7 +296,8 @@ public class JsAwsS3 {
   public JsAwsS3(String awsProfileName, String awsRegionName) throws SeisException {
     AWSCredentials credentials = null;
     awsProfile = awsProfileName;
-    if (awsRegionName == null) awsRegionName = "default";
+    if (awsRegionName == null)
+      awsRegionName = "default";
     awsRegion = awsRegionName;
     try {
       credentials = new ProfileCredentialsProvider(awsProfile).getCredentials();
@@ -311,127 +314,71 @@ public class JsAwsS3 {
           + "location (~/.aws/credentials), and is in valid format.", e);
     }
   }
-
-  /**
-   * Open an existing JavaSeis AWS-S3 dataset
-   * 
-   * @param jsFilePath - path to the JavaSeis 'stub' file on local disk
-   * @throws SeisException - on IO or AWS access errors
-   */
-  public void open(String jsFilePath) throws SeisException {
-    // Load file properties and retrieve metadata
-    propertiesTree = new PropertiesTree(jsFilePath, true);
-    ParameterSet ps;
+  
+  public JsAwsS3() {
     try {
-      ps = ParameterSetIO.readFile(jsFilePath + SS_AWS_S3_PROPERTIES);
+      s3 = AmazonS3ClientBuilder.standard().build();
     } catch (Exception e) {
       e.printStackTrace();
-      throw new SeisException("Could not read " + SS_AWS_S3_PROPERTIES, e.getCause());
+      throw new IllegalStateException("Failure: Could not obtain S3 client",e);
     }
-    String buf = ps.getString("awsRegion", "default");
-    /*
-     * if (!buf.equals(awsRegion)) { throw new SeisException("Current region " +
-     * awsRegion + " does not match file region " + buf); }
-     */    awsBucket = ps.getString("awsBucket", "null");
-    if (awsBucket.equals("null"))
-      throw new SeisException("Could not find AWS Bucket Name");
-    awsPrefix = ps.getString("awsPrefix", "null");
-    if (awsPrefix.equals("null"))
-      throw new SeisException("Could not find AWS Prefix Name");
+    awsProfile = "default";
+    awsRegion = "default";
+  }
+
+  public void openRemote(String bucket, String prefix) throws SeisException {
+    String key = prefix + "/" + FILE_PROPERTIES_JSC;
+    if (s3.doesObjectExist(bucket, key) == false)
+      throw new SeisException("Could not find JS AWS-S3 FileProperties: s3://" + awsBucket + "/" + key);    
+    jscFileProperties = (JscFileProperties) getJsonObject(s3,bucket,key, JscFileProperties.class);
+    this.awsBucket = bucket;
+    this.awsPrefix = prefix;
     loadProperties();
   }
 
   public void loadProperties() throws SeisException {
-    // Load file properties and trace properties
-    filePropertiesParset = propertiesTree.getFileProperties();
-    tracePropertiesParset = propertiesTree.getTraceProperties();
-    traceProperties = new TraceProperties(tracePropertiesParset);
-    // Construct grid definition from FileProperties
-    gridDefinition = GridUtil.fromParameterSet(filePropertiesParset);
     // Get data format and allocate arrays and buffers for traces and headers
-    DataFormat traceFormat = DataFormat.valueOf(filePropertiesParset.getString("TraceFormat", "FLOAT"));
-    nsamp = (int) gridDefinition.getNumSamplesPerTrace();
-    recordLength = TraceCompressor.getRecordLength(traceFormat, nsamp);
-    maxTraces = (int) gridDefinition.getNumTracesPerFrame();
+    GridDefinition grid = jscFileProperties.gridDefinition;
+    nsamp = (int) grid.getNumSamplesPerTrace();
+    recordLength = TraceCompressor.getRecordLength(jscFileProperties.traceFormat, nsamp);
+    maxTraces = (int) grid.getNumTracesPerFrame();
     // We use a byte array and buffer to hold traces and headers
     trcBytes = new byte[recordLength * maxTraces];
     trcBuffer = ByteBuffer.wrap(trcBytes);
-    traceCompressor = new TraceCompressor(traceFormat, nsamp, trcBuffer);
-    hdrLength = filePropertiesParset.getInt("HeaderLengthBytes", 0);
-    // Round header length to an even word boundary
-    int rem = hdrLength % 4;
-    if (rem != 0)
-      hdrLength += rem;
-    hdrWords = hdrLength / 4;
-    hdrBytes = new byte[hdrLength * maxTraces];
-    hdrBuffer = ByteBuffer.wrap(hdrBytes);
-    traceProperties.setBuffer(hdrBuffer);
-    // SeisSpace uses integer arrays to hold headers so we create an 'Int' view
-    hdrBuffer.order(ByteOrder.LITTLE_ENDIAN);
-    intBuffer = hdrBuffer.asIntBuffer();
+    traceCompressor = new TraceCompressor(jscFileProperties.traceFormat, nsamp, trcBuffer);
+    if (jscFileProperties.usesTraceProperties) {
+      hdrLength = jscFileProperties.traceProperties.getHeaderLength();
+      // Round header length to an even word boundary
+      int rem = hdrLength % 4;
+      if (rem != 0)
+        hdrLength += rem;
+      hdrWords = hdrLength / 4;
+      hdrBytes = new byte[hdrLength * maxTraces];
+      hdrBuffer = ByteBuffer.wrap(hdrBytes);
+      jscFileProperties.traceProperties.setBuffer(hdrBuffer);
+      hdrBuffer.order(jscFileProperties.byteOrder);
+      intBuffer = hdrBuffer.asIntBuffer();
+    }
     isOpen = true;
     volRange = new int[3];
-    volRange[0] = (int) gridDefinition.getAxisLogicalOrigin(3);
-    volRange[2] = (int) gridDefinition.getAxisLogicalDelta(3);
-    volRange[1] = volRange[0] + (int) (gridDefinition.getAxisLength(3) - 1) * volRange[2];
+    volRange[0] = (int) grid.getAxisLogicalOrigin(3);
+    volRange[2] = (int) grid.getAxisLogicalDelta(3);
+    volRange[1] = volRange[0] + (int) (grid.getAxisLength(3) - 1) * volRange[2];
     frmRange = new int[3];
-    frmRange[0] = (int) gridDefinition.getAxisLogicalOrigin(2);
-    frmRange[2] = (int) gridDefinition.getAxisLogicalDelta(2);
-    frmRange[1] = frmRange[0] + (int) (gridDefinition.getAxisLength(2) - 1) * frmRange[2];
-    frameCount = (int) (gridDefinition.getAxisLength(2) * gridDefinition.getAxisLength(3));
-  }  
-  
-  public void openRemote(String awsBucketName, String awsPrefixString) throws SeisException {
-    awsBucket = awsBucketName;
-    awsPrefix = awsPrefixString;
-    String objectName = awsPrefix + "/" + FILE_PROPERTIES;
-    if (s3.doesObjectExist(awsBucket, objectName) == false)
-      throw new SeisException("Could not find AWS object: " + objectName);
-    GetObjectRequest gor = new GetObjectRequest(awsBucket, objectName);
-    S3Object s3o = s3.getObject(gor);
-    InputStream is = s3o.getObjectContent();
-    propertiesTree = new PropertiesTree(is);
-    loadProperties();
-  }
-
-
-  public void openRemote(String awsBucketName, String awsPrefixString, String dataDir) throws SeisException {
-    File fdata = new File(dataDir);
-    if (!(fdata.isDirectory() && fdata.canWrite()))
-      throw new SeisException("Cannot write to dataDir " + dataDir);
-    awsBucket = awsBucketName;
-    awsPrefix = awsPrefixString;
-    String objectName = awsPrefix + "/" + FILE_PROPERTIES;
-    if (s3.doesObjectExist(awsBucket, objectName) == false)
-      throw new SeisException("Could not find JS AWS-S3 FileProperties: s3://" + awsBucket + "/" + objectName);
-    String fileName = dataDir + "/" + FILE_PROPERTIES;
-    getTextFile(FILE_PROPERTIES, fileName);
-    propertiesTree = new PropertiesTree(dataDir);
-    loadProperties();
-  }
-
-  public void openLocal(String awsBucketName, String awsPrefixString, String dataDir) throws SeisException {
-    File fdata = new File(dataDir);
-    if (!(fdata.isDirectory() && fdata.canRead()))
-      throw new SeisException("Cannot read from dataDir " + dataDir);
-    awsBucket = awsBucketName;
-    awsPrefix = awsPrefixString;
-    String objectName = awsPrefix + "/" + FILE_PROPERTIES;
-    if (s3.doesObjectExist(awsBucket, objectName) == false)
-      throw new SeisException("Could not find AWS object: " + objectName);
-    propertiesTree = new PropertiesTree(dataDir);
-    loadProperties();
+    frmRange[0] = (int) grid.getAxisLogicalOrigin(2);
+    frmRange[2] = (int) grid.getAxisLogicalDelta(2);
+    frmRange[1] = frmRange[0] + (int) (grid.getAxisLength(2) - 1) * frmRange[2];
+    frameCount = (int) (grid.getAxisLength(2) * grid.getAxisLength(3));
   }
 
   public float[][] allocateTraceArray() {
     return new float[maxTraces][nsamp];
   }
-  
 
   public int[][] allocateHeaderArray() {
     return new int[maxTraces][hdrWords];
   }
-  
+
   public boolean frameExists(int[] pos) {
     String key = awsPrefix + "/Traces" + "/V" + pos[3] + "/F" + pos[2];
     return s3.doesObjectExist(awsBucket, key);
@@ -447,8 +394,8 @@ public class JsAwsS3 {
    * @throws SeisException - on AWS or IO errors
    */
   public void putFrame(int ntrc, float[][] trcs, int[][] hdrs, int[] pos) throws SeisException {
-    putFrameHeaders(ntrc, hdrs, pos);
-    putFrameTraces(ntrc, trcs, pos);
+    putFrameHeaders(ntrc, hdrs, pos[2], pos[3]);
+    putFrameTraces(ntrc, trcs, pos[2], pos[3]);
   }
 
   /**
@@ -463,8 +410,8 @@ public class JsAwsS3 {
   public int getFrame(float[][] trcs, int[][] hdrs, int[] pos) throws SeisException {
     if (!frameExists(pos))
       return 0;
-    getFrameHeaders(hdrs, pos);
-    int ntrc = getFrameTraces(trcs, pos);
+    getFrameHeaders(hdrs, pos[2], pos[3]);
+    int ntrc = getFrameTraces(trcs, pos[2], pos[3]);
     return ntrc;
   }
 
@@ -476,8 +423,8 @@ public class JsAwsS3 {
    * @param pos   - file position where data will be written
    * @throws SeisException - on AWS or IO errors
    */
-  public void putFrameTraces(int ntrc, float[][] frame, int[] pos) throws SeisException {
-    String key = awsPrefix + "/Traces" + "/V" + pos[3] + "/F" + pos[2];
+  public void putFrameTraces(int ntrc, float[][] frame, int frameIndex, int volumeIndex) throws SeisException {
+    String key = awsPrefix + "/Traces" + "/V" + volumeIndex + "/F" + frameIndex;
     try {
       traceCompressor.packFrame(ntrc, frame);
       InputStream is = new ByteArrayInputStream(trcBytes);
@@ -499,10 +446,11 @@ public class JsAwsS3 {
    * @return - number of traces retrieved
    * @throws SeisException - on AWS or IO errors
    */
-  public int getFrameTraces(float[][] frame, int[] pos) throws SeisException {
-    String key = awsPrefix + "/Traces" + "/V" + pos[3] + "/F" + pos[2];
+  public int getFrameTraces(float[][] frame, int frameIndex, int volumeIndex) throws SeisException {
+    String key = awsPrefix + "/Traces" + "/V" + volumeIndex + "/F" + frameIndex;
     int traceCount = 0;
-    if (s3.doesObjectExist(awsBucket, key) == false) return 0;
+    if (s3.doesObjectExist(awsBucket, key) == false)
+      return 0;
     try {
       GetObjectRequest gor = new GetObjectRequest(awsBucket, key);
       S3Object s3o = s3.getObject(gor);
@@ -529,8 +477,8 @@ public class JsAwsS3 {
    * @param pos  - file position where data will be written
    * @throws SeisException - on AWS or IO errors
    */
-  public void putFrameHeaders(int trcCount, int[][] hdrs, int[] pos) throws SeisException {
-    String key = awsPrefix + "/Headers" + "/V" + pos[3] + "/F" + pos[2];
+  public void putFrameHeaders(int trcCount, int[][] hdrs, int frameIndex, int volumeIndex) throws SeisException {
+    String key = awsPrefix + "/Headers" + "/V" + volumeIndex + "/F" + frameIndex;
     try {
       intBuffer.clear();
       for (int j = 0; j < trcCount; j++) {
@@ -547,10 +495,23 @@ public class JsAwsS3 {
     }
   }
 
-  public void putFrameHeaders(int trcCount, TraceProperties tp, int[] pos) throws SeisException {
-    String key = awsPrefix + "/Headers" + "/V" + pos[3] + "/F" + pos[2];
+  public void putFrameProperties(int trcCount, TracePropertiesImpl tp, int frameIndex, int volumeIndex)
+      throws SeisException {
+    String key = awsPrefix + "/Headers" + "/V" + volumeIndex + "/F" + frameIndex;
     try {
-      InputStream is = new ByteBufferBackedInputStream(tp.getBuffer());
+      ByteBuffer inBuffer = tp.getBuffer();
+      inBuffer.rewind();
+      if (tp.getHeaderLength() != tp.getRecordLength()) {
+        int inLength = tp.getRecordLength();
+        int outLength = tp.getHeaderLength();
+        hdrBuffer.clear();
+        for (int j = 0; j < trcCount; j++) {
+          copyBufferToBuffer(inBuffer, inLength * j, hdrBuffer, outLength * j, outLength);
+        }
+        hdrBuffer.rewind();
+        inBuffer = hdrBuffer;
+      }
+      InputStream is = new ByteBufferBackedInputStream(inBuffer);
       ObjectMetadata om = new ObjectMetadata();
       om.setContentLength(trcCount * hdrLength);
       om.addUserMetadata("traceCount", Integer.toString(trcCount));
@@ -561,6 +522,13 @@ public class JsAwsS3 {
     }
   }
 
+  void copyBufferToBuffer(ByteBuffer inBuffer, int inOffset, ByteBuffer outBuffer, int outOffset, int length) {
+    inBuffer.position(inOffset);
+    inBuffer.limit(inOffset + length);
+    outBuffer.position(outOffset);
+    outBuffer.put(inBuffer);
+  }
+
   /**
    * Retrieve headers from an AWS-S3 dataset
    * 
@@ -568,8 +536,8 @@ public class JsAwsS3 {
    * @param pos  - file position for the read
    * @throws SeisException - on AWS or IO errors
    */
-  public int getFrameHeaders(int[][] hdrs, int[] pos) throws SeisException {
-    String key = awsPrefix + "/Headers" + "/V" + pos[3] + "/F" + pos[2];
+  public int getFrameHeaders(int[][] hdrs, int frameIndex, int volumeIndex) throws SeisException {
+    String key = awsPrefix + "/Headers" + "/V" + volumeIndex + "/F" + frameIndex;
     int traceCount = 0;
     intBuffer.clear();
     try {
@@ -599,50 +567,91 @@ public class JsAwsS3 {
    * @param pos  - file position for the read
    * @throws SeisException - on AWS or IO errors
    */
-  public TraceProperties getFrameProperties(int[] pos) throws SeisException {
-    String key = awsPrefix + "/Headers" + "/V" + pos[3] + "/F" + pos[2];
-    hdrBuffer.clear();
+  public TraceProperties getFrameProperties( int frameIndex, int volumeIndex) throws SeisException {
+    getFrameProperties(jscFileProperties.traceProperties, frameIndex, volumeIndex);
+    return jscFileProperties.traceProperties;
+  }
+  
+  public int getFrameProperties(TracePropertiesImpl tp, int frameIndex, int volumeIndex) throws SeisException {
+    String key = awsPrefix + "/Headers" + "/V" + volumeIndex + "/F" + frameIndex;
     try {
       GetObjectRequest gor = new GetObjectRequest(awsBucket, key);
       S3Object s3o = s3.getObject(gor);
+      int traceCount = Integer.parseInt(s3o.getObjectMetadata().getUserMetaDataOf("traceCount"));
+      int maxbytes = traceCount * tp.getRecordLength();
       InputStream is = s3o.getObjectContent();
-      int count = 0;
+      ByteBuffer outBuffer = tp.getBuffer();
+      outBuffer.rewind();
       int len = 0;
-      while ((len = is.read(hdrBytes, count, 16384)) > 0)
+      int count = 0;
+      while ((len = is.read(xfrBytes, 0, Math.min(16384, maxbytes - count))) > 0) {
+        outBuffer.put(xfrBytes, 0, len);
         count += len;
+      }
+      com.amazonaws.util.IOUtils.drainInputStream(is);
       s3o.close();
+      return traceCount;
     } catch (Exception e) {
       e.printStackTrace();
       throw new SeisException("JsAwsS3 getFrame failed: ", e.getCause());
     }
-    return traceProperties;
   }
-  
+
   public void setPosition(int[] position) {
-    System.arraycopy(position, 0, pos, 0, 4 );
+    System.arraycopy(position, 0, pos, 0, 4);
   }
 
   /**
-   * Store a file in the current JavaSeis AWS-S3 Bucket/Prefix location
+   * Store an object as a json string in the current JavaSeis AWS-S3 Bucket/Prefix
+   * location
    * 
    * @param objectName - name to append to Bucket/Prefix
    * @param filePath   - Path to file to be stored
    * @throws SeisException - on I/O or AWS errors
    */
-  public void putFile(String objectName, String filePath) throws SeisException {
-    String key = awsPrefix + "/" + objectName;
+  public static void putJsonObject(AmazonS3 awsS3, String bucket, String key, Object obj, boolean overwrite) throws SeisException {
+    if (awsS3.doesObjectExist(bucket,key) == true && overwrite == false)
+      throw new SeisException("JsAwsS3 putObject failed, object already exists: s3://" + bucket + "/" + key);
     try {
-      File f = new File(filePath);
-      InputStream is = new FileInputStream(f);
+      byte[] bytes = JsonUtil.toJsonString(obj).getBytes();
       ObjectMetadata om = new ObjectMetadata();
-      om.setContentLength(f.length());
-      s3.putObject(awsBucket, key, is, om);
+      om.setContentLength(bytes.length);
+      InputStream is = new ByteArrayInputStream(bytes);
+      awsS3.putObject(bucket, key, is, om);
     } catch (Exception e) {
-      e.printStackTrace();
-      throw new SeisException("JsAwsS3 putFile failed for file: " + filePath, e.getCause());
+      throw new SeisException("JsAwsS3 putObject failed for:  s3://" + bucket + "/" + key, e.getCause());
     }
   }
-  
+
+  /**
+   * Store an object as a json string in the current JavaSeis AWS-S3 Bucket/Prefix
+   * location
+   * 
+   * @param objectName - name to append to Bucket/Prefix
+   * @param filePath   - Path to file to be stored
+   * @throws SeisException - on I/O or AWS errors
+   */
+  public static Object getJsonObject(AmazonS3 awsS3, String bucket, String key, Class<?> objClass) throws SeisException {
+    if (awsS3.doesObjectExist(bucket, key) == false)
+      throw new SeisException("JsAwsS3 getJsonObject failed, object does not exist: s3://" + bucket + "/" + key);
+    try {
+      GetObjectRequest gor = new GetObjectRequest(bucket, key);
+      S3Object s3o = awsS3.getObject(gor);
+      int maxbytes = (int) s3o.getObjectMetadata().getContentLength();
+      byte[] bytes = new byte[maxbytes];
+      InputStream is = s3o.getObjectContent();
+      int len = 0;
+      int count = 0;
+      while ((len = is.read(bytes, count, Math.min(16384, maxbytes - count))) > 0) {
+        count += len;
+      }
+      com.amazonaws.util.IOUtils.drainInputStream(is);
+      s3o.close();
+      return JsonUtil.fromJsonString(objClass, new String(bytes));
+    } catch (Exception e) {
+      throw new SeisException("JsAwsS3 getObject failed for: s3://" + bucket + "/" + key, e);
+    }
+  }
 
   /**
    * Store a file in the current JavaSeis AWS-S3 Bucket/Prefix location
@@ -651,7 +660,9 @@ public class JsAwsS3 {
    * @param filePath   - Path to file to be stored
    * @throws SeisException - on I/O or AWS errors
    */
-  public static void putFile(AmazonS3 s3handle, String bucket, String key, String filePath) throws SeisException {
+  public static void putFile(AmazonS3 s3handle, String bucket, String key, String filePath, boolean overwrite) throws SeisException {
+    if (s3handle.doesObjectExist(bucket, key) == true && overwrite == false)
+      throw new SeisException("JsAwsS3 putFile failed, object already exists s3://" + bucket + "/" + key);
     try {
       File f = new File(filePath);
       InputStream is = new FileInputStream(f);
@@ -681,7 +692,7 @@ public class JsAwsS3 {
       BufferedWriter writer = new BufferedWriter(new FileWriter(filePath));
       String line = null;
       while ((line = reader.readLine()) != null) {
-        writer.append(line+"\n");
+        writer.append(line + "\n");
       }
       writer.close();
       reader.close();
@@ -713,19 +724,36 @@ public class JsAwsS3 {
   public int[] getFrameRange() {
     return frmRange;
   }
-
-  public PropertiesTree getPropertiesTree() {
-    return propertiesTree;
+  
+  public int[] getShape() {
+    int ndim = jscFileProperties.gridDefinition.getNumDimensions();
+    int[] shape = new int[ndim];
+    for (int i=0; i<ndim; i++) {
+      shape[i] = (int) jscFileProperties.gridDefinition.getAxisLength(i);
+    }
+    return shape;
   }
 
   public GridDefinition getGridDefinition() {
-    return gridDefinition;
+    return jscFileProperties.gridDefinition;
   }
 
   public TraceProperties traceProperties() {
-    return traceProperties;
+    return jscFileProperties.traceProperties;
   }
 
+  public BinGrid getBinGrid() {
+    return jscFileProperties.binGrid;
+  }
+
+  public Instant getTimeZero() {
+    return jscFileProperties.timeZero;
+  }
+  
+  public void setTimeZero( Instant t0 ) {
+    jscFileProperties.timeZero = t0;
+  }
+  
   public static int bufLen = 16384;
   public static byte[] readBuf = new byte[bufLen];
 
@@ -747,95 +775,8 @@ public class JsAwsS3 {
     return count;
   }
 
-  public static String[] getLogicalRangeStrings(String path) {
-    String[] nullRanges = new String[] { "null", "null", "null", "null" };
-    if (isJsAwsS3(path) == false)
-      return nullRanges;
-    PropertiesTree props = null;
-    try {
-      props = new PropertiesTree(path);
-    } catch (SeisException e) {
-      return nullRanges;
-    }
-    ParameterSet fileProperties = props.getFileProperties();
-    GridDefinition grid = GridUtil.fromParameterSet(fileProperties);
-    int n = grid.getNumDimensions();
-    long[] lo = grid.getAxisLogicalOrigins();
-    long[] ld = grid.getAxisLogicalDeltas();
-    long[] l = grid.getAxisLengths();
-    String[] ranges = new String[n];
-    for (int i = 0; i < n; i++) {
-      ranges[i] = String.format("%d,%d,%d", lo[i], lo[i] + ld[i] * (l[i] - 1), ld[i]);
-    }
-    for (int i = n; i < 4; i++) {
-      ranges[i] = "null";
-    }
-    return ranges;
-  }
-
   public static void main(String[] args) {
-    float EPS = 1f / 16384f;
-    try {
-      //String path = "/data_home/meagerdas/prod/example.js";
-      String path = "/transferspace/momacmo/meagerdas/test/110aws-s3test.js";
-      JsAwsS3.createFromExisting("default","default","momacmos3", path, true);
-      JsAwsS3 sss3 = new JsAwsS3("default");
-      sss3.open(path);
-      int nframe = (int) sss3.gridDefinition.getAxisLength(2);
-      int ntrc = (int) sss3.gridDefinition.getAxisLength(1);
-      int ns = (int) sss3.gridDefinition.getAxisLength(0);
-      int hdrWords = sss3.hdrWords;
-      float[][] frame = new float[ntrc][ns];
-      int[][] hdrs = new int[ntrc][hdrWords];
-      int[] pos = new int[4];
-      int[] frange = sss3.getFrameRange();
-      int[] vrange = sss3.getVolumeRange();
-      pos[3] = vrange[0];
-      nframe = 10;
-      for (int k = 0; k < nframe; k++) {
-        int val = frange[0] + frange[2] * k;
-        ArrayMath.fill(val, frame);
-        ArrayMath.fill(val, hdrs);
-        pos[2] = val;
-        System.out.println("Write headers for frame " + val);
-        sss3.putFrameHeaders(ntrc, hdrs, pos);
-        System.out.println("Write traces for frame " + val);
-        sss3.putFrameTraces(ntrc, frame, pos);
-      }
-      System.out.println("Output complete");
-      sss3.shutdown();
-      System.out.println(Arrays.toString(JsAwsS3.getLogicalRangeStrings(path)));
-      System.out.println("Open and read");
-      sss3 = new JsAwsS3("default");
-      sss3.open(path);
-      for (int k = 0; k < nframe; k++) {
-        int val = frange[0] + frange[2] * k;
-        pos[2] = val;
-        ArrayMath.fill(0, frame);
-        ArrayMath.fill(0, hdrs);
-        System.out.println("Read headers for frame " + val);
-        sss3.getFrameHeaders(hdrs, pos);
-        System.out.println("Read traces for frame " + val);
-        sss3.getFrameTraces(frame, pos);
-        for (int j = 0; j < ntrc; j++) {
-          for (int i = 0; i < ns; i++) {
-            if (Math.abs(frame[j][i] - val) > EPS) {
-              System.out.println("Trace Out of range at: " + i + ", " + j + " value " + frame[j][i]);
-              System.exit(-1);
-            }
-          }
-          for (int i = 0; i < hdrWords; i++) {
-            if (hdrs[j][i] != val) {
-              System.out.println("Header Out of range at: " + i + ", " + j + " value " + hdrs[j][i]);
-              System.exit(-1);
-            }
-          }
-        }
-      }
-    } catch (Exception e) {
-      e.printStackTrace();
-      System.exit(-1);
-    }
+    
     System.out.println("Success");
   }
 
